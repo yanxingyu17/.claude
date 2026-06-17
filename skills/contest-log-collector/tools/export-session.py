@@ -5,8 +5,9 @@ Export AI Coding sessions from staging into the demo repo's logs/ directory.
 Staging path:  ~/.claude/contest-collector-staging/<github_login>/<date>/<tool>__<sid>.jsonl
 Target path:   <repo_root>/logs/<github_login>/<date>/<tool>__<sid>.jsonl
 
-This is the contestant's *consent gate*: nothing reaches the demo repo until
-this script copies it.
+Normally sessions auto-export into the demo repo's logs/ at session end
+(see the adapters). This script is the manual path: list, re-export, or
+selectively export staged sessions.
 
 Usage:
   python3 tools/export-session.py --latest
@@ -195,6 +196,75 @@ def cmd_list(args, sessions: list[dict]) -> int:
     return 0
 
 
+def cmd_backfill(args) -> int:
+    dest = Path(args.dest) if args.dest else repo_root()
+    if dest is None:
+        sys.stderr.write("Cannot detect demo repo. "
+                         "Run inside the repo or pass --dest.\n")
+        return 2
+
+    claude_projects = Path.home() / ".claude" / "projects"
+    if not claude_projects.is_dir():
+        sys.stderr.write(f"No Claude Code history found at {claude_projects}\n")
+        return 1
+
+    skill_root = Path(__file__).resolve().parent.parent
+    core_py = skill_root / "adapters" / "shared" / "snapshot_core.py"
+    if not core_py.exists():
+        sys.stderr.write(f"Cannot find snapshot_core.py at {core_py}\n")
+        return 1
+
+    transcripts = sorted(claude_projects.glob("*/*.jsonl"))
+    if not transcripts:
+        sys.stderr.write("No transcript files found in Claude Code history.\n")
+        return 0
+
+    team_id = subprocess.check_output(
+        ["bash", "-c", "source ~/.claude/contest-collector.env 2>/dev/null && echo $TEAM_ID"],
+        text=True,
+    ).strip() or ""
+    if not team_id:
+        sys.stderr.write("TEAM_ID not found. Run install.sh first.\n")
+        return 2
+
+    print(f"Found {len(transcripts)} transcript(s) in Claude Code history.")
+    print(f"Destination: {dest}/logs/")
+    print()
+
+    success = 0
+    skipped = 0
+    for t in transcripts:
+        sid = t.stem
+        payload = json.dumps({
+            "session_id": sid,
+            "cwd": str(dest),
+            "transcript_path": str(t),
+            "hook_event_name": "SessionEnd",
+        })
+        try:
+            result = subprocess.run(
+                [sys.executable, str(core_py), "--tool", "claude-code"],
+                input=payload, text=True, capture_output=True,
+                env={**subprocess.os.environ, "TEAM_ID": team_id, "CWD": str(dest)},
+                cwd=str(dest),
+            )
+            if result.returncode == 0:
+                if "captured" in result.stderr:
+                    success += 1
+                    print(f"  ✅ {sid[:12]}  {result.stderr.strip().split('-> ')[-1] if '-> ' in result.stderr else 'ok'}")
+                else:
+                    skipped += 1
+            else:
+                print(f"  ⚠️  {sid[:12]}  {result.stderr.strip()[:80]}")
+        except Exception as e:
+            print(f"  ❌ {sid[:12]}  {e}")
+
+    print(f"\nBackfill done: {success} imported, {skipped} skipped (already captured or empty).")
+    if success > 0:
+        print("Next: git add logs/ && git commit -s -m 'logs: backfill history' && git push")
+    return 0
+
+
 def main() -> int:
     p = argparse.ArgumentParser(
         description="Export AI Coding sessions from staging to demo repo logs/.",
@@ -212,6 +282,10 @@ def main() -> int:
                    help="Export sessions since a date (YYYY-MM-DD).")
     p.add_argument("--all", action="store_true",
                    help="Export every session in staging.")
+    p.add_argument("--backfill", action="store_true",
+                   help="Scan Claude Code history (~/.claude/projects/) and "
+                        "re-process all transcripts. Recovers sessions that "
+                        "were created before the hook was installed.")
     p.add_argument("--github-login", metavar="LOGIN",
                    help="Restrict to one member's sessions.")
     p.add_argument("--dest", metavar="PATH",
@@ -227,10 +301,13 @@ def main() -> int:
     if args.list:
         return cmd_list(args, sessions)
 
+    if args.backfill:
+        return cmd_backfill(args)
+
     if not any([args.latest, args.session, args.today, args.since, args.all]):
         p.print_help()
         sys.stderr.write("\nNothing to do. Pick one of "
-                         "--latest, --session, --today, --since, --all, --list.\n")
+                         "--latest, --session, --today, --since, --all, --list, --backfill.\n")
         return 2
 
     selected = filter_sessions(sessions, args)

@@ -24,6 +24,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -33,7 +34,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from get_github_login import resolve_github_login
 
-VERSION = "1.1.1"
+VERSION = "1.2.0"
 SCHEMA_VERSION = "1.0"
 
 DEFAULT_REDACT_RULES = [
@@ -300,6 +301,20 @@ def get_repo_root() -> Path | None:
         return None
 
 
+# Privacy gate: only collect inside an openvela workspace, identified by a
+# `.repo/` dir at the workspace root. Sessions outside it (personal projects)
+# must never be collected. Returns the workspace root, or None if not inside.
+def find_openvela_workspace_root(start_dir: Path) -> Path | None:
+    try:
+        cur = Path(start_dir).resolve()
+        for candidate in [cur, *cur.parents]:
+            if (candidate / ".repo").is_dir():
+                return candidate
+    except Exception:
+        return None
+    return None
+
+
 def get_fallback_author() -> tuple[str, str]:
     fallback = os.environ.get("LOG_FALLBACK_EMAIL", "")
     if fallback:
@@ -337,6 +352,14 @@ def process_claude_stdin(stdin_data: dict, tool: str, team_id: str) -> int:
         return 1
 
     repo_root = get_repo_root() or Path(cwd)
+
+    workspace_root = find_openvela_workspace_root(repo_root)
+    if workspace_root is None:
+        sys.stderr.write(
+            "[session-log] not inside an openvela workspace (no .repo/ found); "
+            "collection disabled for this session.\n"
+        )
+        return 0
 
     login_result = resolve_github_login(repo_root)
     if not login_result[0]:
@@ -437,12 +460,41 @@ def process_claude_stdin(stdin_data: dict, tool: str, team_id: str) -> int:
 
     write_manifest(member_dir, manifest, team_id, github_login, tool)
 
+    auto_export_to_repo(
+        repo_root, member_dir, jsonl_path, session_id,
+        team_id, github_login, tool,
+    )
+
     sys.stderr.write(
-        f"[session-log] captured {result['written']} event(s) -> {rel_path} "
-        f"(remember to 'git add logs/' when committing)\n"
+        f"[session-log] captured {result['written']} event(s) -> {rel_path}\n"
     )
 
     return 0
+
+
+def auto_export_to_repo(repo_root: Path, staging_member_dir: Path, staging_jsonl: Path,
+                        session_id: str, team_id: str, github_login: str, tool: str) -> None:
+    try:
+        dest_member = repo_root / "logs" / github_login
+        dest_jsonl = dest_member / staging_jsonl.relative_to(staging_member_dir)
+        dest_jsonl.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(staging_jsonl, dest_jsonl)
+
+        staging_manifest = read_manifest(staging_member_dir, team_id, github_login, tool)
+        src_entry = next((s for s in staging_manifest.get("sessions", [])
+                          if s.get("session_id") == session_id), None)
+        if src_entry is None:
+            return
+        dest_manifest = read_manifest(dest_member, team_id, github_login, tool)
+        existing = next((s for s in dest_manifest.get("sessions", [])
+                         if s.get("session_id") == session_id), None)
+        if existing:
+            existing.update(src_entry)
+        else:
+            dest_manifest.setdefault("sessions", []).append(src_entry)
+        write_manifest(dest_member, dest_manifest, team_id, github_login, tool)
+    except Exception as e:
+        report_error(staging_member_dir, "auto_export", {"repo_root": str(repo_root), "session_id": session_id}, e)
 
 
 def main() -> int:

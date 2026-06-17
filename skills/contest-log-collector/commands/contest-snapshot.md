@@ -1,8 +1,12 @@
 ---
-description: Export the current AI Coding session from local staging into the demo repo's logs/ directory so it can be committed alongside the contestant's code.
+description: Optionally list or re-export an AI Coding session into the demo repo's logs/ directory. Normally sessions auto-export at session end; this command is for manual listing or re-export.
 ---
 
-The contestant just asked to capture / package / archive this session into the contest repo.
+The contestant asked to list, capture, or re-export a session into the contest repo.
+
+Note: inside an openvela workspace, sessions already auto-export into
+`logs/<github_login>/` at session end, so this command is usually only
+needed to inspect what was captured or to re-export a specific session.
 
 Privacy-first flow: always preview first, then ask for confirmation, then actually export.
 

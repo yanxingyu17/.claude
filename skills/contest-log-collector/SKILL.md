@@ -1,84 +1,70 @@
 ---
 name: contest-log-collector
-description: "为 openvela AI 大赛归集 AI Coding 日志,采用 staging + 显式导出 双层架构。后台 hook 把所有 session 静默写到选手机器本地 staging (~/.claude/contest-collector-staging/),完全不进选手仓。选手说'帮我打包这次会话/把这个 session 存到比赛仓库/contest-snapshot'时,AI 调用 export-session.py 把指定 session 从 staging 复制到选手仓的 logs/<github_login>/,选手 git push 时跟代码一起上去。Trigger: 大赛 AI 日志收集、contest log、AI Coding 日志、打包对话、archive session、归档会话、export session、把会话存到仓库、保存这次对话、把这个 session 提交、contest-snapshot."
+description: "为 openvela AI 大赛归集 AI Coding 日志,采用工作区感应 + 自动入仓架构。只在 openvela 工作区内(当前目录向上能找到 .repo/)才采集;工作区内的对话结束时自动写入选手仓 logs/<github_login>/(只写文件,不自动 commit/push,选手自己 git push);工作区外的对话(含个人项目)完全不采集。手动工具 contest-snapshot / export-session.py 仍可选,用于查看清单或补导。Trigger: 大赛 AI 日志收集、contest log、AI Coding 日志、打包对话、archive session、归档会话、export session、把会话存到仓库、保存这次对话、把这个 session 提交、contest-snapshot."
 ---
 
 # Contest Log Collector — openvela AI 大赛 AI Coding 日志归集
 
-为 openvela AI 大赛提供 AI Coding 日志归集能力,**两阶段、选手知情同意**。
+为 openvela AI 大赛提供 AI Coding 日志归集能力,**工作区感应、对话结束自动入仓**。
 
 ## 核心架构
 
 ```
        ┌─────────────────────────────────────────────────────┐
-       │ 阶段 1 (后台采集): 选手机器本地 staging              │
-       │ 路径: ~/.claude/contest-collector-staging/<login>/   │
-       │ 不出本机,不进任何 git 仓                             │
+       │ 门控: 当前目录向上能找到 .repo/ ?                    │
+       │   否 → 不在 openvela 工作区 → 完全不采集             │
+       │   是 → 在 openvela 工作区 → 进入采集                 │
        └─────────────────────────────────────────────────────┘
-                              │
-                              │ 选手说"打包这次会话" / 跑 /contest-snapshot
-                              │ / 直接执行 export-session.py
-                              ↓
+                               │ (在工作区内)
+                               ↓
        ┌─────────────────────────────────────────────────────┐
-       │ 阶段 2 (选手主动导出): demo 仓 logs/<login>/          │
+       │ 对话结束自动写入: demo 仓 logs/<login>/              │
+       │ 只写文件,不自动 commit/push                         │
        │ 选手 git push 时跟代码一起上 GitHub                  │
        └─────────────────────────────────────────────────────┘
 ```
 
-**关键安全特性**: 选手个人项目跟 AI 聊的对话也会进 staging,但 staging **永远不上传**,选手不主动导出 = 选手仓里啥都没有。
+**关键安全特性**: 用"是否在 openvela 工作区(`.repo/`)内"作为隐私门控 —— 选手在个人项目(工作区外)跟 AI 聊的对话**完全不采集**;只有在比赛工作区内的对话才会自动写入选手仓 `logs/`,且工具自身**永远不会 git push**,上传由选手控制。
 
-## 选手怎么触发"打包"
+## 自动入仓(默认,无需操作)
 
-支持 3 种方式,挑顺手的:
-
-### 1. 自然语言(推荐 — Claude Code / OpenCode 都支持)
-
-直接对 AI 说:
-
-- "帮我打包这次会话"
-- "把这个 session 存到比赛仓库"
-- "归档刚才的对话"
-- "archive this session"
-
-AI 会先跑 `../.claude/skills/contest-log-collector/tools/export-session.py --latest`(预览),把要导的 session 给选手看,等选手确认后再加 `--confirm` 真写入。
-
-### 2. Slash command(Claude Code 支持)
-
-```
-/contest-snapshot
-```
-
-定义在 `.claude/commands/contest-snapshot.md`,触发与上面相同(同样 preview → confirm 两步)。
-
-### 3. 直接跑脚本(任何工具都行)
-
-`install.sh` 装了短命令 `contest-snapshot`(位于 `~/.local/bin/`,自动跳转到工具仓的 `export-session.py`):
+在 openvela 工作区内跟 AI 工具(Claude Code / OpenCode / Codex)对话,会话结束时日志会**自动写入**选手仓的 `logs/<github_login>/`。选手只需在提交代码时一起 push:
 
 ```bash
-# 列出 staging 里所有 session
+git add logs/
+git commit -s -m "logs: capture session"
+git push
+```
+
+## (可选)手动补导
+
+正常流程不需要,但你可以用手动工具查看清单或补导某次会话。
+
+### 1. 短命令 `contest-snapshot`(`install.sh` 装在 `~/.local/bin/`)
+
+```bash
+# 列出本机已采集的所有 session
 contest-snapshot --list
 
-# 预览要导出哪个 (默认就是 preview, 不写文件)
-contest-snapshot --latest
-
-# 真导出 (加 --confirm)
-contest-snapshot --latest --confirm
-
-# 按精确 session ID 导出 (推荐用法,避免 --latest 误选)
+# 补导某个 session (加 --confirm 真写入)
 contest-snapshot --session <session-id> --confirm
 
-# 按日期导出
+# 按日期补导
 contest-snapshot --today --confirm
 contest-snapshot --since 2026-06-15 --confirm
 ```
 
-如果 `~/.local/bin` 不在 PATH 上,用完整路径作为 fallback:
+### 2. 完整路径 fallback(`~/.local/bin` 不在 PATH 时)
 
 ```bash
-python3 ../.claude/skills/contest-log-collector/tools/export-session.py --latest --confirm
+python3 ../.claude/skills/contest-log-collector/tools/export-session.py --list
 ```
 
-> ⚠️ **隐私默认**: 不加 `--confirm` 时只是预览,不会写任何文件,看清楚要导哪个再加 `--confirm`。这是为了避免误导出上一场不该上传的对话。
+### 3. 自然语言 / Slash command
+
+对 AI 说"补导这次会话",或在 Claude Code 里跑 `/contest-snapshot`,AI 会调用 `export-session.py` 预览,确认后加 `--confirm` 写入。
+
+> ⚠️ 手动工具的 `--confirm`:不加时只预览不写文件。手动补导仅用于补救/管理,正常对话已自动入仓。
 
 ## 目录结构
 
@@ -152,10 +138,11 @@ JSONL 每条事件必含字段:
 
 ## 安全特性
 
-- **隐私默认安全**: staging 在本机,不主动导出 → 任何对话不进选手仓
+- **工作区门控**: 只在 openvela 工作区(向上能找到 `.repo/`)内采集,工作区外的对话(含个人项目)完全不采集
+- **不自动上传**: 自动入仓只写本机仓内 `logs/` 文件,工具自身从不 `git push`,上传由选手控制
 - **自动脱敏**: 默认正则覆盖 `sk-*` (API key) / `ghp_*` (GitHub token) / `Bearer *` (auth header)
 - **TEAM_ID 缺失主动拒绝**: 防止数据归属错乱
-- **多人组天然安全**: staging 按 `<github_login>/` 一人一目录,组员之间互不干扰
+- **多人组天然安全**: 按 `<github_login>/` 一人一目录,组员之间互不干扰
 
 ## 工具兼容性
 

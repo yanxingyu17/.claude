@@ -20,7 +20,7 @@ import { platform, homedir } from "os";
 import { execFileSync } from "child_process";
 import { resolveGithubLogin } from "../shared/get_github_login.js";
 
-const VERSION = "1.2.1";
+const VERSION = "1.3.0";
 const SCHEMA_VERSION = "1.0";
 const TOOL_ID = "opencode";
 
@@ -99,6 +99,23 @@ function gitExec(args, cwd, opts = {}) {
 function getRepoRoot() {
   const r = gitExec(["rev-parse", "--show-toplevel"], process.cwd());
   return r.code === 0 ? r.out : null;
+}
+
+// Privacy gate: only collect inside an openvela workspace, identified by a
+// `.repo/` dir at the workspace root. Sessions outside it (personal projects)
+// must never be collected. Returns the workspace root, or null if not inside.
+function findOpenvelaWorkspaceRoot(startDir) {
+  try {
+    let cur = resolve(startDir || process.cwd());
+    while (true) {
+      if (existsSync(join(cur, ".repo"))) return cur;
+      const parent = dirname(cur);
+      if (parent === cur) return null;
+      cur = parent;
+    }
+  } catch {
+    return null;
+  }
 }
 
 function getAuthorFromSshPubkey() {
@@ -533,6 +550,14 @@ export default {
           ? cwdRepoRoot
           : worktree || directory
         : cwdRepoRoot || worktree || directory;
+
+    if (!findOpenvelaWorkspaceRoot(repoRoot || baseDir)) {
+      console.error(
+        "[session-log] not inside an openvela workspace (no .repo/ found); " +
+        "collection disabled for this session."
+      );
+      return {};
+    }
 
     return {
       event: async ({ event }) => {

@@ -8,10 +8,10 @@
 
 1. 拿到仓库后第一件事做什么
 2. 怎么开始用 AI 工具开发
-3. **怎么把对话打包到比赛仓**(关键!)
+3. **对话自动入仓与手动补导**(自动完成,手动可选)
 4. 出了问题怎么办
 
-> **核心架构**: 工具采用**两阶段**设计 — AI 对话先静默落到本机 staging 区(永远不出本机),需要提交到比赛仓时由你**主动说"打包"**才会复制到 demo 仓 logs/。这样你跟 AI 聊任何对话(包括个人项目)都不会被误传到比赛仓。
+> **核心架构**: 工具采用**工作区感应**设计 — 只在 openvela 工作区内(能向上找到 .repo/)才收集；在工作区内对话结束后，日志会自动写入比赛仓 logs/ 目录(只写文件,不自动 commit/push)。工作区外的对话(含个人项目)完全不收集，从根源保护隐私。
 
 > 🌳 **关于 `.claude/`**: 这个仓是大赛工具仓,**已经登记在 manifest 里**,你执行 `repo sync` 时会自动拉到 `<manifest 根>/.claude/`,跟你的 demo 仓是 **sibling**(平级目录)。你不需要 git clone 它,也不需要修改它。
 
@@ -107,11 +107,27 @@ Stop hook 自动落 staging。
 
 ---
 
-## 3. 怎么把对话打包到比赛仓 (关键!)
+## 3. 对话自动入仓与手动补导
 
-工具**不会**自动把对话写进比赛仓。你需要**主动说一句**才会打包。3 种方式选一个:
+工具现在支持**自动入仓**,你不再需要手动执行打包命令。
 
-### 方式 A: 自然语言 (推荐)
+### 3.1 自动入仓流程 (默认)
+
+1. **工作区识别**: 只要你在 openvela 工作区内(即当前目录向上能找到 `.repo/` 目录)启动 AI 工具。
+2. **自动写入**: 对话结束(退出工具)时,日志会自动写入比赛仓的 `logs/<your-github-login>/` 目录下。
+3. **手动提交**: 工具只写文件,**不会**自动执行 git 操作。你仍需手动提交:
+
+```bash
+git add logs/
+git commit -s -m "logs: capture session"
+git push
+```
+
+### 3.2 手动补导与管理 (可选)
+
+如果你需要重新导出、查看清单或有选择性地补导,手动工具仍然可用。3 种方式选一个:
+
+#### 方式 A: 自然语言
 
 跟 AI 说一句:
 
@@ -120,90 +136,52 @@ Stop hook 自动落 staging。
 - "package this conversation"
 - "归档对话"
 
-AI 会先跑 `../.claude/skills/contest-log-collector/tools/export-session.py --latest`(预览),把要导的 session 给你看,等你确认后再加 `--confirm` 真写入。
+AI 会跑 `../.claude/skills/contest-log-collector/tools/export-session.py --latest --confirm` 来执行手动导出。
 
-### 方式 B: Slash Command (Claude Code)
+#### 方式 B: Slash Command (Claude Code)
 
 ```
 /contest-snapshot
 ```
 
-效果同上(同样 preview → confirm 两步)。
+效果同上。
 
-### 方式 C: 直接跑脚本
+#### 方式 C: 直接跑脚本
 
-`install.sh` 在 `~/.local/bin/` 装好了短命令 `contest-snapshot`,自动跳转到工具仓的 `export-session.py`,**强烈推荐使用**:
+`install.sh` 装好了短命令 `contest-snapshot`,用于查看状态或手动导出:
 
 ```bash
-# 1. 列出 staging 里所有 session,确认要导哪个
+# 1. 列出所有 session,确认状态
 contest-snapshot --list
 
-# 2. 预览要导出的 session (默认就是预览,不写文件)
-contest-snapshot --latest
+# 2. 预览特定 session (不写文件)
 contest-snapshot --session <session-id>
-contest-snapshot --today
 
-# 3. 看清楚后,加 --confirm 真导出
-contest-snapshot --latest --confirm
+# 3. 加 --confirm 手动导出(例如误删了 logs/ 需要重导)
 contest-snapshot --session <session-id> --confirm
-contest-snapshot --today --confirm
-contest-snapshot --since 2026-06-15 --confirm
 contest-snapshot --all --confirm
 ```
 
-如果 `~/.local/bin` 不在 PATH 上,执行一次:
-
-```bash
-echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
-source ~/.bashrc
-```
-
-或者用完整路径作为 fallback:
-
-```bash
-python3 ../.claude/skills/contest-log-collector/tools/export-session.py --latest --confirm
-```
-
-> ⚠️ **关键: 不加 `--confirm` 时永远只是预览,不会写任何文件**。
-> 这是为了避免你忘了"上一次跟 AI 聊的是个人项目"就误导出。
-> 推荐流程: `--list` 看清单 → `--session <id>` 预览 → `--session <id> --confirm` 真写。
-
-### 然后正常 commit + push
-
-```bash
-git add logs/
-git commit -s -m "logs: capture session"
-git push
-```
-
-或跟你的代码一起 push:
-
-```bash
-git add .   # 自然包含 logs/
-git commit -s -m "feat: implement xxx"
-git push
-```
+> ⚠️ **提示**: 正常流程下,你只需要关注 `git push`。手动工具仅用于补救或管理。
 
 ---
 
 ## 4. 隐私保护 — 这个工具到底采集什么
 
-### 4.1 哪些**会**被采集到 staging
+### 4.1 哪些**会**被采集
 
-只要你跟 AI 工具(Claude Code / OpenCode / Codex / AIoT-IDE)聊天,**所有对话都会进 staging**:
+工具只在 **openvela 工作区内**(能向上找到 `.repo/` 目录)激活。
 
-- 在比赛仓里聊
-- 在个人项目里聊
-- 在 $HOME 聊
-- ...所有场景
-
-但 **staging 不会上传** — 它只在你电脑的 `~/.claude/contest-collector-staging/`。
+- 只要在工作区内跟 AI 工具聊天,对话会被采集,并在结束时自动写入比赛仓 `logs/`。
+- 采集只在你本机进行,**工具自身永远不会上传** — 是否 push 完全由你控制。
 
 ### 4.2 哪些**会**进比赛仓 (= 评委能看到)
 
-**只有你主动导出的那些 session**。
+**只有在 openvela 工作区内的对话**。
 
-如果你跟 AI 聊了 50 轮,只导出 10 轮,**评委只能看到那 10 轮**,其他 40 轮永远只在你电脑上。
+- 工作区内的对话结束时会自动写入 `logs/`(只写文件,不自动 commit/push)。
+- **工作区外的对话(如你的个人项目)完全不采集**,不会进比赛仓。
+
 
 ### 4.3 字段清单 (会被记录的内容)
 
@@ -277,30 +255,23 @@ python3 ../.claude/skills/contest-log-collector/tools/validate-log.py logs/
 
 ## 6. FAQ
 
-### Q1: 我没说"打包",对话会自己上传吗?
+### Q1: 对话会自动上传吗?
 
-**绝对不会**。工具物理上不会自己 push 到任何 git 仓。staging 在 `~/.claude/contest-collector-staging/`,跟 git 无关。
+**绝对不会**。工具只会在检测到你处于 openvela 工作区时,自动将日志写入你本地比赛仓的 `logs/` 目录。**物理上它不会自己执行 git push**,上传由你完全控制。
 
-### Q2: 我跟 AI 聊了私事(工资/感情/其他项目),会泄漏吗?
+### Q2: 我在个人项目里跟 AI 聊了私事,会泄漏吗?
 
-**只要你不主动说"打包"**,这些对话**永远不会**进比赛仓。它们只存在于你电脑的 staging。
-
-如果你担心,**可以删 staging 里对应文件**(在你导出之前):
-
-```bash
-ls ~/.claude/contest-collector-staging/<your-login>/<date>/
-rm <session-id>.jsonl
-```
+**完全不会**。工具感应到你在非 openvela 工作区(没有 `.repo/` 目录)时,会保持静默,不采集任何内容。
 
 ### Q3: 我能改 staging / logs 里的内容吗?
 
 `../.claude/skills/contest-log-collector/tools/validate-log.py` 会检测 seq 缺号、跨字段不一致、manifest 与文件对不上等手脚,**改 log 等于作弊**。
 
-但**删除整个 session**(导出前在 staging 删除)是允许的 — 这跟"不打包"等价,评委看不到。
+但**删除整个 session**(在 `git commit` 前删掉 `logs/` 下对应文件,或删掉 staging 里的文件)是允许的 — 只要还没 push,评委就看不到。
 
 ### Q4: 我能临时关掉日志收集吗?
 
-**不建议**,大赛规则要求全程归集(staging 全采)。你能控制的是**导出哪些**到比赛仓,这是设计上给选手的隐私边界。
+最简单的办法:在 **openvela 工作区外**(即找不到 `.repo/` 目录的地方)跟 AI 工具对话,工具不会采集任何内容。
 
 ### Q5: 截止时刻怎么办?
 
@@ -374,7 +345,7 @@ git add logs/ && git commit -s -m "logs: final batch" && git push
 ├── nuttx/  apps/  vendor/  ...         # openvela 全量源码
 └── <你的 demo 仓>/                      # 例如 contest2026-042-app
     ├── (你的代码、README、配置等 — install.sh 不动)
-    └── logs/                           # 只有你跑了 export --confirm 后才会出现
+    └── logs/                           # 在工作区内使用 AI 工具后会自动出现
         └── <your-github-login>/
             ├── manifest.json
             └── <date>/<tool>__<sid>.jsonl
