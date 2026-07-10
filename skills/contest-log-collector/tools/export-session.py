@@ -31,6 +31,20 @@ def staging_root() -> Path:
     return Path.home() / ".claude" / "contest-collector-staging"
 
 
+def _load_env_github_login() -> str | None:
+    env_file = Path.home() / ".claude" / "contest-collector.env"
+    if not env_file.is_file():
+        return None
+    try:
+        for line in env_file.read_text(encoding="utf-8").splitlines():
+            if line.startswith("GITHUB_LOGIN="):
+                val = line.split("=", 1)[1].strip().strip('"').strip("'")
+                return val or None
+    except Exception:
+        return None
+    return None
+
+
 def repo_root() -> Path | None:
     try:
         out = subprocess.check_output(
@@ -46,6 +60,10 @@ def list_sessions(github_login: str | None) -> list[dict]:
     root = staging_root()
     if not root.exists():
         return []
+    if github_login is None:
+        env_login = _load_env_github_login()
+        if env_login:
+            github_login = env_login
     sessions = []
     for member_dir in sorted(root.iterdir()):
         if not member_dir.is_dir() or member_dir.name == "errors":
@@ -142,8 +160,12 @@ def copy_session(s: dict, dest_repo: Path, dry_run: bool) -> tuple[bool, str]:
     dest_jsonl.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(src_jsonl, dest_jsonl)
 
+    actual_count = sum(1 for line in dest_jsonl.read_text(encoding="utf-8").splitlines() if line.strip())
+    s["event_count"] = actual_count
+    s["file_path"] = f"logs/{s['github_login']}/{rel_inside}"
+
     update_dest_manifest(s, dest_repo)
-    return True, f"copied -> {dest_jsonl.relative_to(dest_repo)}"
+    return True, f"copied -> {dest_jsonl.relative_to(dest_repo)} ({actual_count} events)"
 
 
 def update_dest_manifest(s: dict, dest_repo: Path) -> None:
@@ -169,10 +191,15 @@ def update_dest_manifest(s: dict, dest_repo: Path) -> None:
                       if x.get("session_id") == s["session_id"]), None)
     if src_entry is None:
         return
+    entry = dict(src_entry)
+    if "event_count" in s:
+        entry["event_count"] = s["event_count"]
+    if "file_path" in s:
+        entry["file_path"] = s["file_path"]
     if existing:
-        existing.update(src_entry)
+        existing.update(entry)
     else:
-        manifest["sessions"].append(src_entry)
+        manifest["sessions"].append(entry)
     manifest["updated_at"] = datetime.now(timezone.utc).isoformat()
     manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False),
                              encoding="utf-8")

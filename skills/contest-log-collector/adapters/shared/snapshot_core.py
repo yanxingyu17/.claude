@@ -415,8 +415,15 @@ def process_claude_stdin(stdin_data: dict, tool: str, team_id: str) -> int:
         return 0
 
     redact_rules = load_redact_rules(member_dir)
-    date_dir = member_dir / local_date()
-    jsonl_path = date_dir / f"{tool}__{session_id}.jsonl"
+    if entry and entry.get("file_path"):
+        existing_rel = entry["file_path"].split(f"{github_login}/", 1)[-1] \
+            if f"{github_login}/" in entry["file_path"] else None
+        if existing_rel:
+            jsonl_path = member_dir / existing_rel
+        else:
+            jsonl_path = member_dir / local_date() / f"{tool}__{session_id}.jsonl"
+    else:
+        jsonl_path = member_dir / local_date() / f"{tool}__{session_id}.jsonl"
 
     try:
         result = append_events(jsonl_path, contest_events, session_id, team_id, github_login, tool, start_seq, redact_rules)
