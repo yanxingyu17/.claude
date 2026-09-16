@@ -177,6 +177,7 @@ contest-snapshot --backfill --source claude     # Claude Code (~/.claude/project
 contest-snapshot --backfill --source opencode   # OpenCode SQLite
 contest-snapshot --backfill --source mimocode   # MiMo Code SQLite
 contest-snapshot --backfill --source cursor     # Cursor state.vscdb
+contest-snapshot --backfill --source codex     # Codex sessions (CLI/IDE/desktop)
 ```
 
 命令会自动扫描对应工具的历史数据,把还没采集过的会话补导进 `logs/`。跑完后:
@@ -339,11 +340,16 @@ git add logs/ && git commit -s -m "logs: final batch" && git push
 - Claude Code(主推,含 AIoT-IDE 内嵌) — 实时 hook
 - AIoT-IDE — 实时 hook
 - OpenCode — 实时 hook + SQLite backfill
-- Codex — 实时 hook
+- Codex(CLI / IDE 扩展 / 桌面 App)— 实时 hook + rollout backfill
 - MiMo Code — 实时 hook + SQLite backfill
 - **Cursor — 仅 SQLite backfill**(见 3.3 章节)
 
 ChatGPT / Cody / 其他没列出的工具**不支持**,产生的对话无法进入 staging。
+
+**Codex 说明**:
+- Codex CLI、IDE 扩展、桌面 App 共享同一份本地会话存储(`$CODEX_HOME/sessions/`,默认 `~/.codex/`),`--backfill --source codex` 一次全部覆盖
+- 桌面 App 的 rollout 格式按防御式解析:无法识别的新格式行会被跳过并记 stderr 警告,不会产生坏数据;如导出数量异常请反馈
+- ChatGPT 桌面 App 里的普通 Chat/Work 对话是云端存储,**不在** Codex 支持范围内
 
 **Cursor 特殊说明**:
 - 只支持 `--backfill --source cursor` 从本机 Cursor SQLite 补导历史,**没有实时 hook**
