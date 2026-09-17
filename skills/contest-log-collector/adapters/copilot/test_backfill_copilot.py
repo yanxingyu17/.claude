@@ -2,15 +2,23 @@
 # SPDX-License-Identifier: Apache-2.0
 # Tests for adapters/copilot/backfill_copilot.py.
 # The .json fixture replicates the real format-v3 session captured from
-# VS Code Copilot Chat on 2026-09-17; the .jsonl fixture exercises the
-# objectMutationLog replay path (kind 0 initial / 1 set / 2 append).
+# VS Code Copilot Chat on 2026-09-17; the .jsonl fixtures exercise the
+# objectMutationLog replay path (kind 0 initial / 1 set / 2 append,
+# including integer array-index paths like ["requests", 0, "response"]
+# reported by a contestant as the incremental-write norm); the
+# session-store.db fixture replicates the Copilot extension's private
+# SQLite layout (sessions + turns tables) per PR #53 feedback.
 # Covers:
 #   T1 real-shaped .json session in workspace   -> user/tool/assistant
 #      events with tool_call_id, model on assistant, ALL OK
 #   T2 .jsonl mutation-log session in workspace -> same via replay
+#   T2b .jsonl with array-index paths           -> replay reaches
+#      nested requests
 #   T3 session in a personal workspace          -> filtered
 #   T4 unsupported format version               -> skipped with warning
 #   T5 idempotent second run                    -> 0 imported
+#   T6 session-store.db primary source          -> cwd-gated import
+#      ordered by turn_index, empty-response turns skipped
 
 import json
 import shutil
@@ -177,6 +185,112 @@ class CopilotBackfillTest(unittest.TestCase):
         self.assertIn("1 session(s) imported", r1.stdout, r1.stdout)
         r2 = self._run_backfill()
         self.assertIn("0 session(s) imported", r2.stdout, r2.stdout)
+
+    def test_jsonl_array_index_path_replay(self):
+        chat = self._make_ws_chat(
+            "hash-ws", f"file://{self.workspace}")
+        base = {
+            "version": 3,
+            "sessionId": "ses-idx",
+            "requests": [
+                {"requestId": "r1", "message": {"text": "original text"},
+                 "response": [], "timestamp": 1762939547595},
+            ],
+        }
+        lines = [
+            json.dumps({"kind": 0, "v": base}),
+            # incremental write into the nested request, the array-index
+            # path form VS Code writes for in-place updates
+            json.dumps({"kind": 1,
+                        "k": ["requests", 0, "response"],
+                        "v": [{"value": "patched answer"}]}),
+        ]
+        (chat / "ses-idx.jsonl").write_text(
+            "\n".join(lines) + "\n", encoding="utf-8")
+        r = self._run_backfill()
+        self.assertIn("1 session(s) imported", r.stdout, r.stdout)
+        jsonl = list(
+            (self.workspace / "logs" / LOGIN).rglob(
+                "copilot__ses-idx.jsonl"))
+        events = [json.loads(l) for l in jsonl[0].read_text().splitlines()]
+        self.assertEqual(
+            [(e["role"], e["text"]) for e in events],
+            [("user", "original text"),
+             ("assistant", "patched answer")])
+
+    def test_session_store_db_import(self):
+        import sqlite3
+        gs = self.user_data / "User" / "globalStorage" / \
+            "github.copilot-chat"
+        gs.mkdir(parents=True)
+        db = gs / "session-store.db"
+        conn = sqlite3.connect(db)
+        conn.execute(
+            "CREATE TABLE sessions (id TEXT, cwd TEXT, repository TEXT, "
+            "branch TEXT, created_at INTEGER)")
+        conn.execute(
+            "CREATE TABLE turns (session_id TEXT, turn_index INTEGER, "
+            "prompt TEXT, assistant_response TEXT, created_at INTEGER, "
+            "model TEXT)")
+        conn.execute(
+            "INSERT INTO sessions VALUES (?, ?, ?, ?, ?)",
+            ("db-ses-1", str(self.workspace), "org/repo", "main",
+             1762939226940))
+        conn.execute(
+            "INSERT INTO sessions VALUES (?, ?, ?, ?, ?)",
+            ("db-ses-personal", "/home/someone/personal", "x/y", "main",
+             1762939226940))
+        # turns deliberately inserted OUT of order: turn_index must govern
+        conn.execute(
+            "INSERT INTO turns VALUES (?, ?, ?, ?, ?, ?)",
+            ("db-ses-1", 1, "second question", "second answer",
+             1762939600000, "copilot/gpt-5.2"))
+        conn.execute(
+            "INSERT INTO turns VALUES (?, ?, ?, ?, ?, ?)",
+            ("db-ses-1", 0, "first question", "first answer",
+             1762939547595, "copilot/gpt-5.2"))
+        # interrupted turn: prompt without response must not crash or
+        # emit an empty event
+        conn.execute(
+            "INSERT INTO turns VALUES (?, ?, ?, ?, ?, ?)",
+            ("db-ses-1", 2, "interrupted question", None,
+             1762939700000, "copilot/gpt-5.2"))
+        conn.commit()
+        conn.close()
+
+        r = self._run_backfill()
+        self.assertIn("1 session(s) imported", r.stdout, r.stdout)
+
+        jsonl = list(
+            (self.workspace / "logs" / LOGIN).rglob(
+                "copilot__db-ses-1.jsonl"))
+        self.assertEqual(len(jsonl), 1)
+        events = [json.loads(l) for l in jsonl[0].read_text().splitlines()]
+        # turn_index order + interrupted turn yields user event only
+        self.assertEqual(
+            [(e["role"], e["text"]) for e in events],
+            [("user", "first question"),
+             ("assistant", "first answer"),
+             ("user", "second question"),
+             ("assistant", "second answer"),
+             ("user", "interrupted question")])
+        self.assertEqual(events[1]["model"], "copilot/gpt-5.2")
+
+        manifest = json.loads(
+            (self.workspace / "logs" / LOGIN / "manifest.json").read_text())
+        entry = next(s for s in manifest["sessions"]
+                     if s["session_id"] == "db-ses-1")
+        self.assertEqual(entry["data_source"], "session-store.db")
+
+        v = subprocess.run(
+            [sys.executable, str(VALIDATE_PY),
+             str(self.workspace / "logs")],
+            capture_output=True, text=True)
+        self.assertEqual(v.returncode, 0, v.stdout + v.stderr)
+
+        self.assertFalse(list(
+            (self.workspace / "logs" / LOGIN).rglob(
+                "copilot__db-ses-personal.jsonl")))
 
 
 if __name__ == "__main__":

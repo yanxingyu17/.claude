@@ -40,6 +40,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sqlite3
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -49,6 +50,9 @@ TOOL_ID = "copilot"
 SCHEMA_VERSION = "1.0"
 SUPPORTED_VERSIONS = {2, 3}
 
+DB_REL_PATH = Path("User") / "globalStorage" / "github.copilot-chat" / \
+    "session-store.db"
+
 
 def vscode_user_data_candidates() -> list[Path]:
     override = os.environ.get("VSCODE_USER_DATA_OVERRIDE")
@@ -57,13 +61,23 @@ def vscode_user_data_candidates() -> list[Path]:
     system = sys.platform
     home = Path.home()
     if system == "darwin":
-        return [home / "Library" / "Application Support" / "Code"]
+        return [
+            home / "Library" / "Application Support" / "Code",
+            home / ".vscode-server" / "data",
+        ]
     if system == "win32":
         appdata = os.environ.get("APPDATA")
-        return [Path(appdata) / "Code"] if appdata else []
+        cands = []
+        if appdata:
+            cands.append(Path(appdata) / "Code")
+        cands.append(home / ".vscode-remote" / "data")
+        return cands
     xdg = os.environ.get("XDG_CONFIG_HOME")
-    return [(Path(xdg) if xdg else home / ".config") / "Code",
-            home / ".config" / "Code"]
+    return [
+        (Path(xdg) if xdg else home / ".config") / "Code",
+        home / ".config" / "Code",
+        home / ".vscode-server" / "data",
+    ]
 
 
 def _sha256_file(path: Path) -> str | None:
@@ -107,9 +121,26 @@ def replay_mutation_log(lines: list[str]) -> dict[str, Any] | None:
       kind 1: {k: [path], v: value}       - set/replace property
       kind 2: {k: [path], v: [items]}     - array splice (append)
       kind 3: {k: [path]}                 - delete property
+    Path segments may be string keys (object) or integer indices
+    (array element), e.g. ["requests", 0, "response"] - the form VS
+    Code writes for incremental updates into nested requests.
     Returns None when the log has no initial object.
     """
     root: Any = None
+
+    def _navigate(node: Any, path: list) -> Any:
+        for seg in path:
+            if isinstance(node, dict) and isinstance(seg, str):
+                node = node.get(seg)
+            elif isinstance(node, list) and isinstance(seg, int):
+                node = node[seg] if -len(node) <= seg < len(node) else None
+            else:
+                return None
+        return node
+
+    def _navigate_to_parent(node: Any, path: list) -> Any:
+        return _navigate(node, path[:-1])
+
     for line in lines:
         if not line.strip():
             continue
@@ -126,24 +157,29 @@ def replay_mutation_log(lines: list[str]) -> dict[str, Any] | None:
             root = value
         elif kind == 3:
             continue
-        elif not isinstance(root, dict) or not path:
+        elif not isinstance(root, (dict, list)) or not path:
             continue
         elif kind in (1, 2):
-            node = root
-            for seg in path[:-1]:
-                nxt = node.get(seg) if isinstance(node, dict) else None
-                if not isinstance(nxt, dict):
-                    return root
-                node = nxt
+            parent = _navigate_to_parent(root, path)
             leaf = path[-1]
             if kind == 1:
-                node[leaf] = value
+                if isinstance(parent, dict):
+                    parent[leaf] = value
+                elif isinstance(parent, list) and isinstance(leaf, int) \
+                        and -len(parent) <= leaf < len(parent):
+                    parent[leaf] = value
             else:
-                arr = node.get(leaf)
-                if isinstance(arr, list) and isinstance(value, list):
-                    arr.extend(value)
-                elif isinstance(value, list):
-                    node[leaf] = value
+                if isinstance(parent, dict):
+                    arr = parent.get(leaf)
+                    if isinstance(arr, list) and isinstance(value, list):
+                        arr.extend(value)
+                    elif isinstance(value, list):
+                        parent[leaf] = value
+                elif isinstance(parent, list) and isinstance(leaf, int) \
+                        and -len(parent) <= leaf < len(parent) \
+                        and isinstance(parent[leaf], list) \
+                        and isinstance(value, list):
+                    parent[leaf].extend(value)
     return root if isinstance(root, dict) else None
 
 
@@ -276,7 +312,7 @@ def _find_workspace_root(start: Path) -> Path | None:
 
 def _write_manifest(dest: Path, github_login: str, team_id: str,
                     session_id: str, events: list[dict], rel_path: str,
-                    integrity: dict) -> None:
+                    integrity: dict, source: str) -> None:
     member_dir = dest / "logs" / github_login
     manifest_path = member_dir / "manifest.json"
     if manifest_path.exists():
@@ -303,6 +339,7 @@ def _write_manifest(dest: Path, github_login: str, team_id: str,
         "collection_mode": "backfill-sqlite",
         "health": "ok",
         "source_integrity": integrity,
+        "data_source": source,
     }
     if entry:
         entry.update(new_entry)
@@ -329,6 +366,138 @@ def _session_in_manifest(dest: Path, github_login: str,
         for s in manifest.get("sessions", []))
 
 
+def _export_session(dest: Path, team_id: str, github_login: str,
+                    session_id: str, events: list[dict],
+                    integrity: dict, source: str) -> bool:
+    if not events:
+        return False
+    date_str = events[0]["ts"][:10]
+    rel_path = (
+        f"logs/{github_login}/{date_str}/"
+        f"{TOOL_ID}__{session_id}.jsonl")
+    jsonl_path = dest / rel_path
+    jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+    seq = 0
+    with jsonl_path.open("w", encoding="utf-8") as f:
+        for e in events:
+            out = {
+                "schema_version": SCHEMA_VERSION,
+                "session_id": session_id,
+                "team_id": team_id,
+                "github_login": github_login,
+                "tool": TOOL_ID,
+                "seq": seq,
+                "ts": e["ts"],
+                "role": e["role"],
+                "text": e["text"],
+            }
+            if e.get("model"):
+                out["model"] = e["model"]
+            if e.get("tool_name"):
+                out["tool_name"] = e["tool_name"]
+            if e.get("tool_call_id"):
+                out["tool_call_id"] = e["tool_call_id"]
+            f.write(json.dumps(out, ensure_ascii=False) + "\n")
+            seq += 1
+    _write_manifest(dest, github_login, team_id, session_id,
+                    events, rel_path, integrity, source)
+    print(f"  [copilot] {str(session_id)[:20]}  wrote "
+          f"{len(events)} event(s) -> {rel_path}  (source: {source})")
+    return True
+
+
+def backfill_session_store_db(dest: Path, workspace_str: str,
+                              team_id: str, github_login: str) -> int:
+    """Primary source per contest feedback (PR #53, yunline): the Copilot
+    extension's own SQLite store. The db carries a `cwd` per session
+    (no workspace.json dependency, works in remote-server setups) and
+    `turn_index` keeps turns naturally ordered. Tables observed in the
+    wild: sessions (id, cwd, repository, branch, agent_name, created_at
+    ...), turns (session ref, turn_index, user prompt, assistant_response),
+    session_files (files/tools touched). Schema is extension-private:
+    every query is guarded and unknown shapes are skipped, never fatal.
+    """
+    imported = 0
+    for user_data in vscode_user_data_candidates():
+        db_path = user_data / DB_REL_PATH
+        if not db_path.is_file():
+            continue
+        try:
+            conn = sqlite3.connect(
+                f"file:{db_path}?mode=ro&immutable=0", uri=True)
+        except sqlite3.Error as e:
+            sys.stderr.write(f"[copilot] cannot open {db_path}: {e}\n")
+            continue
+        conn.row_factory = sqlite3.Row
+        try:
+            tables = {
+                r[0] for r in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'")
+            }
+            if "sessions" not in tables or "turns" not in tables:
+                sys.stderr.write(
+                    f"[copilot] {db_path}: expected sessions/turns "
+                    f"tables not found; skipping\n")
+                continue
+            session_rows = conn.execute(
+                "SELECT * FROM sessions").fetchall()
+        except sqlite3.Error as e:
+            sys.stderr.write(f"[copilot] {db_path} read error: {e}\n")
+            conn.close()
+            continue
+
+        integrity = {
+            "main_sha256": _sha256_file(db_path),
+            "main_size": db_path.stat().st_size,
+            "captured_at": datetime.now(timezone.utc).isoformat(),
+        }
+        count_in_ws = 0
+        for row in session_rows:
+            s = dict(row)
+            sid = s.get("id") or s.get("session_id")
+            cwd = s.get("cwd") or s.get("working_directory")
+            if not sid or not cwd:
+                continue
+            if not str(Path(str(cwd)).resolve()).startswith(workspace_str):
+                continue
+            if _session_in_manifest(dest, github_login, str(sid)):
+                continue
+            count_in_ws += 1
+            turns = conn.execute(
+                "SELECT * FROM turns WHERE session_id = ? "
+                "ORDER BY turn_index", (sid,)).fetchall()
+            events: list[dict] = []
+            for t in turns:
+                td = dict(t)
+                idx = td.get("turn_index", 0)
+                ts = _ms_to_iso(td.get("created_at") or
+                                td.get("timestamp")) if any(
+                    k in td for k in ("created_at", "timestamp")) else \
+                    _ms_to_iso(s.get("created_at"))
+                prompt = td.get("prompt") or td.get("user_prompt") or \
+                    td.get("user_message")
+                if isinstance(prompt, str) and prompt.strip():
+                    events.append({"ts": ts, "role": "user",
+                                   "text": prompt.strip()})
+                resp = td.get("assistant_response") or \
+                    td.get("response")
+                if isinstance(resp, str) and resp.strip():
+                    ev = {"ts": ts, "role": "assistant",
+                          "text": resp.strip()}
+                    model = td.get("model")
+                    if isinstance(model, str) and model:
+                        ev["model"] = model
+                    events.append(ev)
+            if _export_session(dest, team_id, github_login, str(sid),
+                               events, integrity, "session-store.db"):
+                imported += 1
+        conn.close()
+        print(f"[copilot] session-store.db at {db_path}: "
+              f"{count_in_ws} session(s) in workspace, "
+              f"{imported} imported")
+    return imported
+
+
 def backfill(dest: Path, team_id: str, github_login: str) -> int:
     workspace_root = _find_workspace_root(dest)
     if workspace_root is None:
@@ -336,6 +505,9 @@ def backfill(dest: Path, team_id: str, github_login: str) -> int:
               "(no .repo/); skipping")
         return 0
     workspace_str = str(workspace_root.resolve())
+
+    imported = backfill_session_store_db(
+        dest, workspace_str, team_id, github_login)
 
     candidates: list[tuple[str, Path]] = []
     for user_data in vscode_user_data_candidates():
@@ -352,12 +524,6 @@ def backfill(dest: Path, team_id: str, github_login: str) -> int:
         if empty_chat.is_dir():
             candidates.append(("", empty_chat))
 
-    if not candidates:
-        print("[copilot] no VS Code chatSessions directories found; "
-              "skipping")
-        return 0
-
-    imported = 0
     scanned = 0
     for folder, chat_dir in candidates:
         resolved = str(Path(folder).resolve()) if folder else ""
@@ -383,40 +549,11 @@ def backfill(dest: Path, team_id: str, github_login: str) -> int:
                 "main_size": path.stat().st_size if path.is_file() else 0,
                 "captured_at": datetime.now(timezone.utc).isoformat(),
             }
-            date_str = events[0]["ts"][:10]
-            rel_path = (
-                f"logs/{github_login}/{date_str}/"
-                f"{TOOL_ID}__{session_id}.jsonl")
-            jsonl_path = dest / rel_path
-            jsonl_path.parent.mkdir(parents=True, exist_ok=True)
-            seq = 0
-            with jsonl_path.open("w", encoding="utf-8") as f:
-                for e in events:
-                    out = {
-                        "schema_version": SCHEMA_VERSION,
-                        "session_id": session_id,
-                        "team_id": team_id,
-                        "github_login": github_login,
-                        "tool": TOOL_ID,
-                        "seq": seq,
-                        "ts": e["ts"],
-                        "role": e["role"],
-                        "text": e["text"],
-                    }
-                    if e.get("model"):
-                        out["model"] = e["model"]
-                    if e.get("tool_name"):
-                        out["tool_name"] = e["tool_name"]
-                    if e.get("tool_call_id"):
-                        out["tool_call_id"] = e["tool_call_id"]
-                    f.write(json.dumps(out, ensure_ascii=False) + "\n")
-                    seq += 1
-            _write_manifest(dest, github_login, team_id, session_id,
-                            events, rel_path, integrity)
-            imported += 1
-            print(f"  [copilot] {str(session_id)[:20]}  wrote "
-                  f"{len(events)} event(s) -> {rel_path}")
+            if _export_session(dest, team_id, github_login,
+                               str(session_id), events, integrity,
+                               "chatSessions"):
+                imported += 1
 
-    print(f"[copilot] scanned {scanned} session file(s) in workspace, "
-          f"imported {imported}")
+    print(f"[copilot] scanned {scanned} chatSessions file(s), "
+          f"total imported {imported}")
     return imported
