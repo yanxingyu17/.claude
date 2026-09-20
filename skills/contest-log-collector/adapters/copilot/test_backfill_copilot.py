@@ -225,36 +225,66 @@ class CopilotBackfillTest(unittest.TestCase):
         gs.mkdir(parents=True)
         db = gs / "session-store.db"
         conn = sqlite3.connect(db)
+        # DDL replicates the real extension schema (PR #53 round-2
+        # feedback): timestamps are ISO TEXT, not epoch millis
         conn.execute(
-            "CREATE TABLE sessions (id TEXT, cwd TEXT, repository TEXT, "
-            "branch TEXT, created_at INTEGER)")
+            "CREATE TABLE schema_version (version INTEGER NOT NULL)")
         conn.execute(
-            "CREATE TABLE turns (session_id TEXT, turn_index INTEGER, "
-            "prompt TEXT, assistant_response TEXT, created_at INTEGER, "
-            "model TEXT)")
+            "CREATE TABLE sessions (id TEXT PRIMARY KEY, cwd TEXT, "
+            "repository TEXT, host_type TEXT, branch TEXT, "
+            "created_at TEXT, updated_at TEXT)")
         conn.execute(
-            "INSERT INTO sessions VALUES (?, ?, ?, ?, ?)",
-            ("db-ses-1", str(self.workspace), "org/repo", "main",
-             1762939226940))
+            "CREATE TABLE turns (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "session_id TEXT NOT NULL, turn_index INTEGER NOT NULL, "
+            "user_message TEXT, assistant_response TEXT, "
+            "timestamp TEXT)")
         conn.execute(
-            "INSERT INTO sessions VALUES (?, ?, ?, ?, ?)",
-            ("db-ses-personal", "/home/someone/personal", "x/y", "main",
-             1762939226940))
+            "CREATE TABLE session_files (id INTEGER PRIMARY KEY "
+            "AUTOINCREMENT, session_id TEXT NOT NULL, file_path TEXT "
+            "NOT NULL, tool_name TEXT, turn_index INTEGER, "
+            "first_seen_at TEXT)")
+        conn.execute(
+            "INSERT INTO schema_version VALUES (1)")
+        conn.execute(
+            "INSERT INTO sessions VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("db-ses-1", str(self.workspace), "org/repo", "vscode",
+             "main", "2026-07-16T05:42:03.683Z",
+             "2026-07-16T06:00:00.000Z"))
+        conn.execute(
+            "INSERT INTO sessions VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("db-ses-personal", "/home/someone/personal", "x/y",
+             "vscode", "main", "2026-07-16T05:42:03.683Z",
+             "2026-07-16T06:00:00.000Z"))
         # turns deliberately inserted OUT of order: turn_index must govern
         conn.execute(
             "INSERT INTO turns VALUES (?, ?, ?, ?, ?, ?)",
-            ("db-ses-1", 1, "second question", "second answer",
-             1762939600000, "copilot/gpt-5.2"))
+            (1, "db-ses-1", 1, "second question", "second answer",
+             "2026-07-16T05:43:00.100Z"))
         conn.execute(
             "INSERT INTO turns VALUES (?, ?, ?, ?, ?, ?)",
-            ("db-ses-1", 0, "first question", "first answer",
-             1762939547595, "copilot/gpt-5.2"))
+            (2, "db-ses-1", 0, "first question", "first answer",
+             "2026-07-16T05:42:10.200Z"))
         # interrupted turn: prompt without response must not crash or
         # emit an empty event
         conn.execute(
             "INSERT INTO turns VALUES (?, ?, ?, ?, ?, ?)",
-            ("db-ses-1", 2, "interrupted question", None,
-             1762939700000, "copilot/gpt-5.2"))
+            (3, "db-ses-1", 2, "interrupted question", None,
+             "2026-07-16T05:44:00.300Z"))
+        # tool calls: turn_index NULL (the real-world norm), timestamps
+        # straddle the turn boundaries to exercise nearest-turn
+        # attribution
+        conn.execute(
+            "INSERT INTO session_files VALUES (?, ?, ?, ?, ?, ?)",
+            (1, "db-ses-1", "src/foo.c", "read_file", None,
+             "2026-07-16T05:42:11.000Z"))
+        conn.execute(
+            "INSERT INTO session_files VALUES (?, ?, ?, ?, ?, ?)",
+            (2, "db-ses-1", "src/bar.c", "create_file", None,
+             "2026-07-16T05:43:05.000Z"))
+        conn.execute(
+            "INSERT INTO session_files VALUES (?, ?, ?, ?, ?, ?)",
+            (3, "db-ses-1", "src/baz.c", "replace_string_in_file", None,
+             "2026-07-16T05:59:59.000Z"))
         conn.commit()
         conn.close()
 
@@ -265,22 +295,38 @@ class CopilotBackfillTest(unittest.TestCase):
             (self.workspace / "logs" / LOGIN).rglob(
                 "copilot__db-ses-1.jsonl"))
         self.assertEqual(len(jsonl), 1)
+        # date bucket must come from the db timestamps, not export time
+        self.assertIn("2026-07-16", str(jsonl[0]))
         events = [json.loads(l) for l in jsonl[0].read_text().splitlines()]
-        # turn_index order + interrupted turn yields user event only
+        got = [(e["role"], e.get("tool_name"), e["text"],
+                e["ts"]) for e in events]
         self.assertEqual(
-            [(e["role"], e["text"]) for e in events],
-            [("user", "first question"),
-             ("assistant", "first answer"),
-             ("user", "second question"),
-             ("assistant", "second answer"),
-             ("user", "interrupted question")])
-        self.assertEqual(events[1]["model"], "copilot/gpt-5.2")
+            got,
+            [("user", None, "first question",
+              "2026-07-16T05:42:10.200Z"),
+             ("assistant", None, "first answer",
+              "2026-07-16T05:42:10.200Z"),
+             ("tool", "read_file", "src/foo.c",
+              "2026-07-16T05:42:11.000Z"),
+             ("user", None, "second question",
+              "2026-07-16T05:43:00.100Z"),
+             ("assistant", None, "second answer",
+              "2026-07-16T05:43:00.100Z"),
+             ("tool", "create_file", "src/bar.c",
+              "2026-07-16T05:43:05.000Z"),
+             ("user", None, "interrupted question",
+              "2026-07-16T05:44:00.300Z"),
+             ("tool", "replace_string_in_file", "src/baz.c",
+              "2026-07-16T05:59:59.000Z")])
+        self.assertEqual(
+            [e["seq"] for e in events], list(range(len(events))))
 
         manifest = json.loads(
             (self.workspace / "logs" / LOGIN / "manifest.json").read_text())
         entry = next(s for s in manifest["sessions"]
                      if s["session_id"] == "db-ses-1")
         self.assertEqual(entry["data_source"], "session-store.db")
+        self.assertEqual(entry["started_at"], "2026-07-16T05:42:10.200Z")
 
         v = subprocess.run(
             [sys.executable, str(VALIDATE_PY),

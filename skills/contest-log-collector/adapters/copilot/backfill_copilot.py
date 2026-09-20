@@ -196,14 +196,35 @@ def load_session(path: Path) -> dict[str, Any] | None:
         return None
 
 
-def _ms_to_iso(ms: Any) -> str:
+def _ms_to_iso(ms: Any) -> str | None:
+    """Normalize a timestamp to ISO-8601 Z (millisecond precision).
+
+    session-store.db stores timestamps as ISO TEXT (DDL default
+    strftime('%Y-%m-%dT%H:%M:%fZ','now')); chatSessions .json files
+    store epoch milliseconds. Both must parse. Returns None when the
+    value is absent/unparseable so callers can fall back to a
+    session-level timestamp - never silently substitute 'now', which
+    collapsed every event onto the export moment (PR #53 round 2).
+    """
+    if isinstance(ms, str) and ms.strip():
+        s = ms.strip()
+        try:
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+            dt = datetime.fromisoformat(s)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc).strftime(
+                "%Y-%m-%dT%H:%M:%S.") + \
+                f"{dt.astimezone(timezone.utc).microsecond // 1000:03d}Z"
+        except ValueError:
+            pass
     try:
         dt = datetime.fromtimestamp(int(ms) / 1000, tz=timezone.utc)
         return dt.strftime("%Y-%m-%dT%H:%M:%S.") + \
             f"{dt.microsecond // 1000:03d}Z"
     except (TypeError, ValueError, OSError):
-        return datetime.now(timezone.utc).strftime(
-            "%Y-%m-%dT%H:%M:%S.000Z")
+        return None
 
 
 def _response_text(parts: Any) -> str:
@@ -266,13 +287,15 @@ def session_to_events(session: dict[str, Any], session_id: str,
     requests = session.get("requests") or []
     if not isinstance(requests, list):
         return []
+    session_ts = _ms_to_iso(session.get("creationDate")) or \
+        datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
     for req in requests:
         if not isinstance(req, dict):
             continue
         msg = req.get("message") or {}
         user_text = msg.get("text") if isinstance(msg, dict) else None
-        ts = _ms_to_iso(req.get("timestamp"))
+        ts = _ms_to_iso(req.get("timestamp")) or session_ts
         model = req.get("modelId")
 
         if isinstance(user_text, str) and user_text.strip():
@@ -452,6 +475,7 @@ def backfill_session_store_db(dest: Path, workspace_str: str,
             "captured_at": datetime.now(timezone.utc).isoformat(),
         }
         count_in_ws = 0
+        has_session_files = "session_files" in tables
         for row in session_rows:
             s = dict(row)
             sid = s.get("id") or s.get("session_id")
@@ -466,19 +490,17 @@ def backfill_session_store_db(dest: Path, workspace_str: str,
             turns = conn.execute(
                 "SELECT * FROM turns WHERE session_id = ? "
                 "ORDER BY turn_index", (sid,)).fetchall()
-            events: list[dict] = []
+
+            session_ts = _ms_to_iso(s.get("created_at"))
+            turn_events: list[tuple[str | None, dict]] = []
             for t in turns:
                 td = dict(t)
-                idx = td.get("turn_index", 0)
-                ts = _ms_to_iso(td.get("created_at") or
-                                td.get("timestamp")) if any(
-                    k in td for k in ("created_at", "timestamp")) else \
-                    _ms_to_iso(s.get("created_at"))
-                prompt = td.get("prompt") or td.get("user_prompt") or \
-                    td.get("user_message")
+                ts = _ms_to_iso(td.get("timestamp")) or session_ts
+                prompt = td.get("user_message") or td.get("prompt") or \
+                    td.get("user_prompt")
                 if isinstance(prompt, str) and prompt.strip():
-                    events.append({"ts": ts, "role": "user",
-                                   "text": prompt.strip()})
+                    turn_events.append((ts, {"ts": ts, "role": "user",
+                                             "text": prompt.strip()}))
                 resp = td.get("assistant_response") or \
                     td.get("response")
                 if isinstance(resp, str) and resp.strip():
@@ -487,7 +509,46 @@ def backfill_session_store_db(dest: Path, workspace_str: str,
                     model = td.get("model")
                     if isinstance(model, str) and model:
                         ev["model"] = model
-                    events.append(ev)
+                    turn_events.append((ts, ev))
+
+            # Tool calls: session_files rows carry the auditable evidence
+            # of real file operations (read/create/replace). The
+            # turn_index column is NULL in practice (6203/6203 on the
+            # reported machine), so rows are attributed to the turn
+            # whose timestamp is the latest one <= first_seen_at; rows
+            # predating the first turn attach to it.
+            if has_session_files:
+                file_rows = conn.execute(
+                    "SELECT id, file_path, tool_name, turn_index, "
+                    "first_seen_at FROM session_files WHERE session_id = ?",
+                    (sid,)).fetchall()
+                turn_ts_list = [ts for ts, _ in turn_events if ts]
+                for fr in file_rows:
+                    fd = dict(fr)
+                    tool_name = fd.get("tool_name") or "unknown"
+                    file_path = fd.get("file_path") or ""
+                    if not file_path:
+                        continue
+                    seen = _ms_to_iso(fd.get("first_seen_at"))
+                    event_ts = seen
+                    sort_ts = seen
+                    if seen and turn_ts_list:
+                        earlier = [t for t in turn_ts_list if t <= seen]
+                        sort_ts = earlier[-1] if earlier else \
+                            turn_ts_list[0]
+                    if sort_ts is None and turn_ts_list:
+                        sort_ts = turn_ts_list[0]
+                    if event_ts is None:
+                        event_ts = sort_ts
+                    turn_events.append((sort_ts, {
+                        "ts": event_ts, "role": "tool",
+                        "text": file_path,
+                        "tool_name": tool_name,
+                        "tool_call_id": f"{sid}-file-{fd.get('id', '')}",
+                    }))
+
+            turn_events.sort(key=lambda p: (p[0] or session_ts or ""))
+            events = [ev for _, ev in turn_events]
             if _export_session(dest, team_id, github_login, str(sid),
                                events, integrity, "session-store.db"):
                 imported += 1
