@@ -133,7 +133,112 @@ def load_transcript(transcript_path: Path) -> list[dict] | None:
         return None
 
 
-def expand_claude_event(raw_event: dict, fallback_ts: str) -> list[dict]:
+CODEX_ROLLOUT_LINE_TYPES = {"session_meta", "response_item", "event_msg",
+                            "turn_context", "compacted", "token_usage_record",
+                            "world_state", "retained_context",
+                            "security_risk_score", "realtime_item",
+                            "inter_agent_communication",
+                            "inter_agent_communication_metadata"}
+CODEX_ENV_BLOB_PREFIXES = (
+    "<permissions instructions>",
+    "<skills_instructions>",
+    "<environment_context>",
+)
+
+
+def _codex_content_to_text(content) -> str:
+    if isinstance(content, str):
+        return content.strip()
+    if not isinstance(content, list):
+        return ""
+    parts = []
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") in ("input_text", "output_text", "text"):
+            t = item.get("text")
+            if isinstance(t, str) and t.strip():
+                parts.append(t.strip())
+    return "\n".join(parts)
+
+
+def expand_codex_rollout_line(raw_event: dict, fallback_ts: str,
+                              state: dict) -> list[dict]:
+    """Convert one Codex rollout JSONL line to zero-or-more contest events.
+
+    Codex rollout schema (codex-rs/history, stable across 0.142-0.155;
+    re-verified against source 2026-09-20):
+      top-level: {timestamp, ordinal?, type, payload}
+      - session_meta: payload has session_id/id, cwd, originator
+      - turn_context: payload has cwd + model info
+      - response_item: payload is a ResponseItem; type "message" carries
+        role + content[] of input_text/output_text. Other payload types
+        (reasoning / function_call / ghost_snapshot / ...) yield nothing:
+        their argument blobs have no contest schema slot; the backfill
+        adapter remains the richer extraction path for tool detail.
+      - event_msg: payload.type "user_message" echoes the prompt;
+        de-duplicated against the preceding response_item user message
+        via the state dict passed in by the caller.
+    `state` tracks {"last_user_text", "model", "cwd"} ACROSS lines of
+    one transcript - the caller must pass the same dict for every line
+    of a session, or user-message de-duplication and model attribution
+    silently break.
+    """
+    out: list[dict] = []
+    ts = raw_event.get("timestamp") or fallback_ts
+    rtype = raw_event.get("type")
+    payload = raw_event.get("payload") or {}
+    if not isinstance(payload, dict):
+        return out
+
+    if rtype == "session_meta":
+        state["cwd"] = payload.get("cwd") or state.get("cwd")
+        return out
+
+    if rtype == "turn_context":
+        model = payload.get("model")
+        if isinstance(model, str) and model:
+            state["model"] = model
+        state["cwd"] = payload.get("cwd") or state.get("cwd")
+        return out
+
+    if rtype == "response_item":
+        if payload.get("type") != "message":
+            return out
+        role = payload.get("role")
+        if role not in ("user", "assistant"):
+            return out
+        text = _codex_content_to_text(payload.get("content"))
+        if not text:
+            return out
+        if text.startswith(CODEX_ENV_BLOB_PREFIXES):
+            return out
+        ev = {"ts": ts, "role": role, "text": text}
+        if role == "assistant" and state.get("model"):
+            ev["model"] = state["model"]
+        if role == "user":
+            state["last_user_text"] = text
+        out.append(ev)
+        return out
+
+    if rtype == "event_msg":
+        if payload.get("type") != "user_message":
+            return out
+        text = payload.get("message")
+        if not isinstance(text, str) or not text.strip():
+            return out
+        text = text.strip()
+        if state.get("last_user_text") == text:
+            return out
+        state["last_user_text"] = text
+        out.append({"ts": ts, "role": "user", "text": text})
+        return out
+
+    return out
+
+
+def expand_claude_event(raw_event: dict, fallback_ts: str,
+                        codex_state: dict | None = None) -> list[dict]:
     """Convert one Claude Code transcript event to zero-or-more contest events.
 
     Schema (verified against real ~/.claude/projects/*.jsonl):
@@ -142,10 +247,20 @@ def expand_claude_event(raw_event: dict, fallback_ts: str) -> list[dict]:
       - assistant.message.content is a list of blocks: text / thinking / tool_use
       - user.message.content is str (plain input) OR list (containing tool_result blocks)
       - tool_result blocks carry tool_use_id pairing back to assistant tool_use
+
+    Codex rollout lines ({type: session_meta|response_item|event_msg|...,
+    payload: {...}}) are detected and dispatched to the Codex parser, so
+    one hook pipeline serves both tools.
     """
     out: list[dict] = []
     top_type = raw_event.get("type")
     ts = raw_event.get("timestamp") or fallback_ts
+
+    if top_type in CODEX_ROLLOUT_LINE_TYPES and "payload" in raw_event \
+            and "message" not in raw_event:
+        return expand_codex_rollout_line(
+            raw_event, fallback_ts,
+            codex_state if codex_state is not None else {})
 
     if top_type in ("progress", "file-history-snapshot", "queue-operation", "permission-mode", "agent-name", "summary", "attachment"):
         return out
@@ -410,8 +525,10 @@ def process_claude_stdin(stdin_data: dict, tool: str, team_id: str) -> int:
         return 0
 
     contest_events = []
+    codex_state: dict = {}
     for raw in new_raw:
-        contest_events.extend(expand_claude_event(raw, fallback_ts=iso_now()))
+        contest_events.extend(expand_claude_event(
+            raw, fallback_ts=iso_now(), codex_state=codex_state))
 
     if not contest_events:
         if entry is not None:
